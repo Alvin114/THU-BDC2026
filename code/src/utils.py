@@ -465,7 +465,7 @@ def create_ranking_dataset_multiprocess(data, features, sequence_length, ranking
     from functools import partial
     from tqdm import tqdm
     if max_workers is None:
-        max_workers = min(mp.cpu_count(), 6)
+        max_workers = min(mp.cpu_count(), 10)
     
     print(f"使用 {max_workers} 个进程处理数据")
     

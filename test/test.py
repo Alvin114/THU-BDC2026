@@ -67,7 +67,7 @@ def run_docker_compose_up(tar_name):
     # command = "docker compose up"
     command = "docker compose -p test up -d"
     subprocess.run(command, shell=True, check=True)
-    print("Started docker-compose.")
+    print("Started docker compose.")
 
     sumtm = 0
     client = get_docker_client()
