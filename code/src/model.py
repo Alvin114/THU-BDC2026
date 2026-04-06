@@ -60,8 +60,10 @@ class FeatureAttention(nn.Module):
         time_weights = self.attention_time(x)  # [batch*num_stocks, seq_len, 1]
         time_weights = torch.softmax(time_weights, dim=1)
         
-        # 特征维度注意力
-        feature_weights = self.attention_feature(x.transpose(1, 2)).transpose(1, 2)  # [batch*num_stocks, seq_len, 1]
+        # 特征维度注意力（修复维度问题）
+        x_reshaped = x.view(-1, d_model)
+        feature_weights = self.attention_feature(x_reshaped)  # [batch*num_stocks * seq_len, 1]
+        feature_weights = feature_weights.view(batch_size_seq, seq_len, 1)
         feature_weights = torch.sigmoid(feature_weights)
         
         # 组合注意力
