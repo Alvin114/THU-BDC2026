@@ -1,4 +1,4 @@
-# 配置参数
+# 配置参数1
 sequence_length = 60
 feature_num = '158+39'
 config = {

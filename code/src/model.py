@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 import math
 
-# 位置编码模块
+# '位置编码模块'
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, dropout=0.1, max_len=5000):
         super(PositionalEncoding, self).__init__()
