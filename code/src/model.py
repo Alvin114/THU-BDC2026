@@ -40,15 +40,18 @@ class FeatureAttention(nn.Module):
     """增强的特征注意力模块，同时考虑时间和特征维度"""
     def __init__(self, d_model, dropout=0.1):
         super(FeatureAttention, self).__init__()
+        # 确保隐藏层维度可整除
+        hidden_dim = max(16, d_model // 4)
+        
         self.attention_time = nn.Sequential(
-            nn.Linear(d_model, d_model // 4),
+            nn.Linear(d_model, hidden_dim),
             nn.Tanh(),
-            nn.Linear(d_model // 4, 1)
+            nn.Linear(hidden_dim, 1)
         )
         self.attention_feature = nn.Sequential(
-            nn.Linear(d_model, d_model // 4),
+            nn.Linear(d_model, hidden_dim),
             nn.Tanh(),
-            nn.Linear(d_model // 4, 1)
+            nn.Linear(hidden_dim, 1)
         )
         self.dropout = nn.Dropout(dropout)
         
@@ -60,8 +63,8 @@ class FeatureAttention(nn.Module):
         time_weights = self.attention_time(x)  # [batch*num_stocks, seq_len, 1]
         time_weights = torch.softmax(time_weights, dim=1)
         
-        # 特征维度注意力（修复维度问题）
-        x_reshaped = x.view(-1, d_model)
+        # 特征维度注意力（严格确保维度正确）
+        x_reshaped = x.contiguous().view(-1, d_model)  # [batch*num_stocks * seq_len, d_model]
         feature_weights = self.attention_feature(x_reshaped)  # [batch*num_stocks * seq_len, 1]
         feature_weights = feature_weights.view(batch_size_seq, seq_len, 1)
         feature_weights = torch.sigmoid(feature_weights)
