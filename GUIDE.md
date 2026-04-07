@@ -12,11 +12,13 @@
 
 linux
 
-`source .venv/bin/activate`
+`source .venv/bin/activate.fish`
 
 windows
 
 `.\.venv\Scripts\activate`
+
+
 
 成功激活
 
