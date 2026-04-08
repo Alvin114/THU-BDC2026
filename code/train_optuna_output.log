@@ -1,0 +1,15 @@
+==========================================
+  四种方案对比训练
+  1. 双路排序模型（冠军方案）
+  2. GRU + XGBoost 两阶段集成
+  3. DFFormer + MoE 双流架构
+  4. NDCG@K + 多周期特征增强
+==========================================
+
+==========================================
+  运行方案3 Optuna 超参调优 (48 trials)
+==========================================
+Traceback (most recent call last):
+  File "/Users/conrad/Desktop/THU-BDC2026/code/src/train_df_former_optuna.py", line 30, in <module>
+    import optuna
+ModuleNotFoundError: No module named 'optuna'

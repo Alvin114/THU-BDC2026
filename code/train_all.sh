@@ -6,6 +6,7 @@
 #       bash train_all.sh 2        -> 只运行方案2
 #       bash train_all.sh 3        -> 只运行方案3
 #       bash train_all.sh 4        -> 只运行方案4
+#       bash train_all.sh optuna   -> 运行方案3 Optuna 超参调优
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -83,9 +84,19 @@ else
         4)
             run_scheme 4 "NDCG@K + 多周期特征" "train_enhanced.py"
             ;;
+        optuna)
+            echo ""
+            echo "=========================================="
+            echo "  运行方案3 Optuna 超参调优 (48 trials)"
+            echo "=========================================="
+            (
+                cd "$SCRIPT_DIR" || exit 1
+                uv run python src/train_df_former_optuna.py
+            )
+            ;;
         *)
             echo "未知方案号: $1"
-            echo "可用: 1, 2, 3, 4"
+            echo "可用: 1, 2, 3, 4, optuna"
             exit 1
             ;;
     esac

@@ -40,7 +40,7 @@ class DualPathConfig:
     nhead = 4
     num_layers = 3
     dim_feedforward = 512
-    batch_size = 4
+    batch_size = 32        # 4→32，AMP 可承载更大 batch
     learning_rate = 1e-5
     dropout = 0.1
     num_epochs = 50
@@ -329,12 +329,13 @@ def collate_fn(batch):
 from model_dual_path import DualPathRankingModel, DualPathRankingLoss
 
 
-def train_epoch(model, dataloader, criterion, optimizer, device, epoch, writer, cfg):
+def train_epoch(model, dataloader, criterion, optimizer, device, epoch, writer, cfg, scaler=None):
     model.train()
     total_loss = 0.0
     total_ndcg = 0.0
     total_metrics = {}
     n_batches = 0
+    use_amp = scaler is not None
 
     for batch in tqdm(dataloader, desc=f"[DualPath] Train Epoch {epoch+1}"):
         sequences = batch['sequences'].to(device)
@@ -342,16 +343,28 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, writer, 
         masks = batch['masks'].to(device)
 
         optimizer.zero_grad()
-        up_logits, down_logits = model(sequences)
 
-        masked_up = up_logits * masks + (1 - masks) * (-1e9)
-        masked_down = down_logits * masks + (1 - masks) * (-1e9)
-        masked_targets = targets * masks
-
-        loss = criterion(masked_up, masked_down, masked_targets, masks)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-        optimizer.step()
+        if use_amp:
+            from mixed_precision_utils import get_autocast_context
+            with get_autocast_context(device):
+                up_logits, down_logits = model(sequences)
+                masked_up = up_logits * masks + (1 - masks) * (-1e9)
+                masked_down = down_logits * masks + (1 - masks) * (-1e9)
+                masked_targets = targets * masks
+                loss = criterion(masked_up, masked_down, masked_targets, masks)
+            scaler.scale(loss).backward()
+            scaler.unscale_()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            scaler.step()
+        else:
+            up_logits, down_logits = model(sequences)
+            masked_up = up_logits * masks + (1 - masks) * (-1e9)
+            masked_down = down_logits * masks + (1 - masks) * (-1e9)
+            masked_targets = targets * masks
+            loss = criterion(masked_up, masked_down, masked_targets, masks)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            optimizer.step()
 
         total_loss += loss.item()
 
@@ -369,11 +382,12 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, writer, 
     return total_loss / n_batches, total_metrics
 
 
-def evaluate_epoch(model, dataloader, criterion, device, epoch, writer, cfg):
+def evaluate_epoch(model, dataloader, criterion, device, epoch, writer, cfg, scaler=None):
     model.eval()
     total_loss = 0.0
     total_metrics = {}
     n_batches = 0
+    use_amp = scaler is not None
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc=f"[DualPath] Eval Epoch {epoch+1}"):
@@ -381,13 +395,22 @@ def evaluate_epoch(model, dataloader, criterion, device, epoch, writer, cfg):
             targets = batch['targets'].to(device)
             masks = batch['masks'].to(device)
 
-            up_logits, down_logits = model(sequences)
+            if use_amp:
+                from mixed_precision_utils import get_autocast_context
+                with get_autocast_context(device):
+                    up_logits, down_logits = model(sequences)
+            else:
+                up_logits, down_logits = model(sequences)
 
             masked_up = up_logits * masks + (1 - masks) * (-1e9)
             masked_down = down_logits * masks + (1 - masks) * (-1e9)
             masked_targets = targets * masks
 
-            loss = criterion(masked_up, masked_down, masked_targets, masks)
+            if use_amp:
+                with get_autocast_context(device):
+                    loss = criterion(masked_up, masked_down, masked_targets, masks)
+            else:
+                loss = criterion(masked_up, masked_down, masked_targets, masks)
             total_loss += loss.item()
 
             metrics = calculate_ndcg_metrics(masked_up, masked_targets, masks, k=cfg.ndcg_k)
@@ -492,6 +515,11 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.num_epochs, eta_min=cfg.learning_rate * 0.1)
 
+    # AMP GradScaler（仅 CUDA/MPS 启用，CPU 回退为 None）
+    from mixed_precision_utils import AmpGradScaler
+    amp_scaler = AmpGradScaler(optimizer, device)
+    print(f"AMP enabled: {amp_scaler.enabled}, device: {device}")
+
     writer = SummaryWriter(log_dir=os.path.join(cfg.output_dir, 'log'))
 
     # 训练
@@ -503,11 +531,11 @@ def main():
     for epoch in range(cfg.num_epochs):
         print(f"\n=== Epoch {epoch+1}/{cfg.num_epochs} ===")
 
-        train_loss, train_metrics = train_epoch(model, train_loader, criterion, optimizer, device, epoch, writer, cfg)
+        train_loss, train_metrics = train_epoch(model, train_loader, criterion, optimizer, device, epoch, writer, cfg, amp_scaler)
         print(f"Train Loss: {train_loss:.4f} | NDCG@{cfg.ndcg_k}: {train_metrics['ndcg']:.4f} | "
               f"Pred Sum: {train_metrics['pred_return_sum']:.4f} | Max Sum: {train_metrics['max_return_sum']:.4f}")
 
-        eval_loss, eval_metrics = evaluate_epoch(model, val_loader, criterion, device, epoch, writer, cfg)
+        eval_loss, eval_metrics = evaluate_epoch(model, val_loader, criterion, device, epoch, writer, cfg, amp_scaler)
         print(f"Eval  Loss: {eval_loss:.4f} | NDCG@{cfg.ndcg_k}: {eval_metrics['ndcg']:.4f} | "
               f"Pred Sum: {eval_metrics['pred_return_sum']:.4f} | Max Sum: {eval_metrics['max_return_sum']:.4f}")
 

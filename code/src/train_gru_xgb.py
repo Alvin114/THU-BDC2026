@@ -51,7 +51,7 @@ class GRUConfig:
     gru_hidden = 128
     gru_layers = 2
     dropout = 0.1
-    batch_size = 4
+    batch_size = 32        # 4→32，AMP 可承载更大 batch
     learning_rate = 1e-4          # GRU 训练用稍大的学习率
     num_epochs_gru = 30            # Stage 1 GRU 训练轮数
     xgb_estimators = 200           # Stage 2 XGBoost 轮数
@@ -263,11 +263,12 @@ from model_gru_xgb import GRU_XGBoost_Model, AsymmetricLoss, StockVolatilityClus
 
 
 def stage1_train_gru(model, train_loader, val_loader, criterion, optimizer, device,
-                      num_epochs, cfg, writer, val_start):
-    """Stage 1: 训练 GRU 编码器"""
+                      num_epochs, cfg, writer, val_start, scaler=None):
+    """Stage 1: 训练 GRU 编码器（AMP 混合精度）"""
     print("\n" + "="*60)
     print("Stage 1: 训练 GRU 时序编码器")
     print("="*60)
+    use_amp = scaler is not None
 
     best_metric = -float('inf')
     best_epoch = -1
@@ -285,15 +286,26 @@ def stage1_train_gru(model, train_loader, val_loader, criterion, optimizer, devi
             masks = batch['masks'].to(device)
 
             optimizer.zero_grad()
-            scores = model(sequences)  # [batch, num_stocks]
 
-            masked_scores = scores * masks + (1 - masks) * (-1e9)
-            masked_targets = targets * masks
-
-            loss = criterion(masked_scores, masked_targets, masks)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-            optimizer.step()
+            if use_amp:
+                from mixed_precision_utils import get_autocast_context
+                with get_autocast_context(device):
+                    scores = model(sequences)
+                    masked_scores = scores * masks + (1 - masks) * (-1e9)
+                    masked_targets = targets * masks
+                    loss = criterion(masked_scores, masked_targets, masks)
+                scaler.scale(loss).backward()
+                scaler.unscale_()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                scaler.step()
+            else:
+                scores = model(sequences)
+                masked_scores = scores * masks + (1 - masks) * (-1e9)
+                masked_targets = targets * masks
+                loss = criterion(masked_scores, masked_targets, masks)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                optimizer.step()
 
             total_loss += loss.item()
             n_batches += 1
@@ -580,12 +592,17 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.num_epochs_gru, eta_min=cfg.learning_rate * 0.1)
 
+    # AMP GradScaler（仅 CUDA/MPS 启用）
+    from mixed_precision_utils import AmpGradScaler
+    amp_scaler = AmpGradScaler(optimizer, device)
+    print(f"AMP enabled: {amp_scaler.enabled}, device: {device}")
+
     writer = SummaryWriter(log_dir=os.path.join(cfg.output_dir, 'log'))
 
     # Stage 1: 训练 GRU
     stage1_metric = stage1_train_gru(
         model, train_loader, val_loader, criterion, optimizer, device,
-        cfg.num_epochs_gru, cfg, writer, val_start
+        cfg.num_epochs_gru, cfg, writer, val_start, amp_scaler
     )
 
     # 加载最佳 GRU 模型用于 Stage 2

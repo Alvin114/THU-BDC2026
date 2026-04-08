@@ -8,6 +8,7 @@
   3. 情绪特征注入：换手率、市场状态嵌入
   4. ListMLE + Pairwise Hinge + MoE Load Balancing 多目标损失
   5. NDCG@5 作为主要评估与早停指标
+  6. AMP 混合精度训练（RTX 5090 优化）
 """
 
 import sys
@@ -47,7 +48,7 @@ class MoEConfig:
     nhead = 4
     num_layers = 3
     dim_feedforward = 512
-    batch_size = 4
+    batch_size = 32        # 4→32，AMP 可承载更大 batch
     learning_rate = 1e-5
     dropout = 0.1
     num_epochs = 50
@@ -267,11 +268,12 @@ def collate_fn(batch):
 from model_df_former import DFFormerMoE, DFFormerMoELoss
 
 
-def train_epoch(model, dataloader, criterion, optimizer, device, epoch, writer, cfg):
+def train_epoch(model, dataloader, criterion, optimizer, device, epoch, writer, cfg, scaler=None):
     model.train()
     total_loss = 0.0
     total_metrics = {}
     n_batches = 0
+    use_amp = scaler is not None
 
     for batch in tqdm(dataloader, desc=f"[DFFormer+MoE] Train Epoch {epoch+1}"):
         sequences = batch['sequences'].to(device)
@@ -280,15 +282,21 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, writer, 
 
         optimizer.zero_grad()
 
-        # DFFormer + MoE 前向传播
-        scores, load_bal_loss = model(sequences, sentiment_features=None, market_regime=None)
-
-        # 计算损失
-        loss = criterion(scores, targets, masks, load_bal_loss)
-
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-        optimizer.step()
+        if use_amp:
+            from mixed_precision_utils import get_autocast_context
+            with get_autocast_context(device):
+                scores, load_bal_loss = model(sequences, sentiment_features=None, market_regime=None)
+                loss = criterion(scores, targets, masks, load_bal_loss)
+            scaler.scale(loss).backward()
+            scaler.unscale_()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            scaler.step()
+        else:
+            scores, load_bal_loss = model(sequences, sentiment_features=None, market_regime=None)
+            loss = criterion(scores, targets, masks, load_bal_loss)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            optimizer.step()
 
         total_loss += loss.item()
 
@@ -307,11 +315,12 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, writer, 
     return total_loss / n_batches, total_metrics
 
 
-def evaluate_epoch(model, dataloader, criterion, device, epoch, writer, cfg):
+def evaluate_epoch(model, dataloader, criterion, device, epoch, writer, cfg, scaler=None):
     model.eval()
     total_loss = 0.0
     total_metrics = {}
     n_batches = 0
+    use_amp = scaler is not None
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc=f"[DFFormer+MoE] Eval Epoch {epoch+1}"):
@@ -319,8 +328,14 @@ def evaluate_epoch(model, dataloader, criterion, device, epoch, writer, cfg):
             targets = batch['targets'].to(device)
             masks = batch['masks'].to(device)
 
-            scores, load_bal_loss = model(sequences, sentiment_features=None, market_regime=None)
-            loss = criterion(scores, targets, masks, load_bal_loss)
+            if use_amp:
+                from mixed_precision_utils import get_autocast_context
+                with get_autocast_context(device):
+                    scores, load_bal_loss = model(sequences, sentiment_features=None, market_regime=None)
+                    loss = criterion(scores, targets, masks, load_bal_loss)
+            else:
+                scores, load_bal_loss = model(sequences, sentiment_features=None, market_regime=None)
+                loss = criterion(scores, targets, masks, load_bal_loss)
 
             total_loss += loss.item()
 
@@ -423,6 +438,11 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.num_epochs, eta_min=cfg.learning_rate * 0.1)
 
+    # AMP GradScaler（仅 CUDA/MPS 启用，CPU 回退为 None）
+    from mixed_precision_utils import AmpGradScaler
+    amp_scaler = AmpGradScaler(optimizer, device)
+    print(f"AMP enabled: {amp_scaler.enabled}, device: {device}")
+
     writer = SummaryWriter(log_dir=os.path.join(cfg.output_dir, 'log'))
 
     # 训练
@@ -434,10 +454,10 @@ def main():
     for epoch in range(cfg.num_epochs):
         print(f"\n=== Epoch {epoch+1}/{cfg.num_epochs} ===")
 
-        train_loss, train_metrics = train_epoch(model, train_loader, criterion, optimizer, device, epoch, writer, cfg)
+        train_loss, train_metrics = train_epoch(model, train_loader, criterion, optimizer, device, epoch, writer, cfg, amp_scaler)
         print(f"Train Loss: {train_loss:.4f} | NDCG@{cfg.ndcg_k}: {train_metrics['ndcg']:.4f}")
 
-        eval_loss, eval_metrics = evaluate_epoch(model, val_loader, criterion, device, epoch, writer, cfg)
+        eval_loss, eval_metrics = evaluate_epoch(model, val_loader, criterion, device, epoch, writer, cfg, amp_scaler)
         print(f"Eval  Loss: {eval_loss:.4f} | NDCG@{cfg.ndcg_k}: {eval_metrics['ndcg']:.4f}")
 
         scheduler.step()
